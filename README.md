@@ -1,4 +1,4 @@
-﻿# QuantumCore
+﻿# QuantumCore - 量子核
 
 嵌入式混合存储引擎 — SQLite + Redis 的融合体。
 
