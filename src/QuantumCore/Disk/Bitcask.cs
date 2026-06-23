@@ -3,7 +3,8 @@
 // 顺序写 + 内存索引 + 定期合并压缩
 //
 // 文件格式（每条记录）：
-//   [4B CRC] [4B key_len] [8B timestamp] [key_len B key] [val_len B value] [4B val_len]
+//   [4B CRC32] [4B key_len] [8B timestamp] [key_len B key] [4B val_len] [val_len B value]
+//   CRC32 覆盖范围：key_len + timestamp + key + val_len + value
 //   总记录头 = 16 字节 + key + value
 // ============================================================================
 
@@ -38,7 +39,6 @@ internal sealed class Bitcask : IDisposable
     private int _compacting; // 防止并发压缩
 
     // ── 常量 ──
-    private const int HeaderSize = 16; // CRC(4) + keyLen(4) + timestamp(8)
     private const string ActiveLogName = "active.log";
     private const string OldLogPrefix = "segment_";
 
@@ -293,20 +293,25 @@ internal sealed class Bitcask : IDisposable
 
     // ── 编解码 ──
 
+    private const int CrcSize = 4;
+    private const int HeaderSize = CrcSize + 4 + 8; // CRC(4) + keyLen(4) + timestamp(8) = 16
+
     /// <summary>
     /// 编码一条记录为字节数组
-    /// 格式：[4B key_len][8B timestamp][key_len B key][4B val_len][val_len B value]
+    /// 格式：[4B CRC32][4B key_len][8B timestamp][key_len B key][4B val_len][val_len B value]
     /// </summary>
     private static byte[] EncodeEntry(string key, string? value)
     {
         var keyBytes = System.Text.Encoding.UTF8.GetBytes(key);
         var valueBytes = value != null ? System.Text.Encoding.UTF8.GetBytes(value) : Array.Empty<byte>();
         var timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var valLen = value != null ? valueBytes.Length : -1;
 
-        // 预分配（避免 List 拷贝）
-        var totalSize = 4 + 8 + keyBytes.Length + 4 + valueBytes.Length;
+        // payload = keyLen(4) + timestamp(8) + key + valLen(4) + value
+        var payloadSize = 4 + 8 + keyBytes.Length + 4 + valueBytes.Length;
+        var totalSize = CrcSize + payloadSize;
         var buffer = new byte[totalSize];
-        var offset = 0;
+        var offset = CrcSize; // 跳过 CRC 位置（最后计算）
 
         // key_len (4 bytes)
         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset), keyBytes.Length);
@@ -321,7 +326,6 @@ internal sealed class Bitcask : IDisposable
         offset += keyBytes.Length;
 
         // val_len (4 bytes, -1 表示删除标记)
-        var valLen = value != null ? valueBytes.Length : -1;
         BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset), valLen);
         offset += 4;
 
@@ -331,15 +335,23 @@ internal sealed class Bitcask : IDisposable
             Buffer.BlockCopy(valueBytes, 0, buffer, offset, valueBytes.Length);
         }
 
+        // CRC32 覆盖 payload 部分
+        var crc = Crc32.Compute(buffer.AsSpan(CrcSize, payloadSize));
+        BinaryPrimitives.WriteUInt32LittleEndian(buffer.AsSpan(0), crc);
+
         return buffer;
     }
 
     /// <summary>
-    /// 从字节数组解码一条记录
+    /// 从字节数组解码一条记录，校验 CRC32
     /// </summary>
     private static BitcaskEntry DecodeEntry(byte[] buffer)
     {
         var offset = 0;
+
+        // 读取 CRC
+        var storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(offset));
+        offset += 4;
 
         var keyLen = BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(offset));
         offset += 4;
@@ -359,27 +371,37 @@ internal sealed class Bitcask : IDisposable
             value = System.Text.Encoding.UTF8.GetString(buffer, offset, valLen);
         }
 
+        // CRC32 校验：覆盖 payload 部分
+        var actualCrc = Crc32.Compute(buffer.AsSpan(CrcSize, buffer.Length - CrcSize));
+        if (storedCrc != actualCrc)
+        {
+            throw new InvalidDataException(
+                $"Bitcask CRC 校验失败: key='{key}', 存储={storedCrc:X8}, 计算={actualCrc:X8}");
+        }
+
         return new BitcaskEntry(0, timestamp, key, value, buffer.Length);
     }
 
     /// <summary>
-    /// 重放日志文件重建内存索引
+    /// 重放日志文件重建内存索引，校验每条记录的 CRC32
     /// </summary>
     private void RebuildIndex()
     {
         _activeLog.Seek(0, SeekOrigin.Begin);
         var offset = 0L;
+        var corruptedCount = 0;
 
         while (offset < _activeLog.Length)
         {
             _activeLog.Seek(offset, SeekOrigin.Begin);
 
-            // 读取 header（key_len + timestamp）
-            var headerBuf = new byte[12];
-            if (_activeLog.Read(headerBuf, 0, 12) < 12) break;
+            // 读取 header（CRC + key_len + timestamp）
+            var headerBuf = new byte[HeaderSize];
+            if (_activeLog.Read(headerBuf, 0, HeaderSize) < HeaderSize) break;
 
-            var keyLen = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.AsSpan(0));
-            var timestamp = BinaryPrimitives.ReadInt64LittleEndian(headerBuf.AsSpan(4));
+            var storedCrc = BinaryPrimitives.ReadUInt32LittleEndian(headerBuf.AsSpan(0));
+            var keyLen = BinaryPrimitives.ReadInt32LittleEndian(headerBuf.AsSpan(4));
+            var timestamp = BinaryPrimitives.ReadInt64LittleEndian(headerBuf.AsSpan(8));
 
             if (keyLen <= 0 || keyLen > 1024 * 1024) break; // 安全检查
 
@@ -397,14 +419,29 @@ internal sealed class Bitcask : IDisposable
             if (valLen > 1024 * 1024) break;
 
             // 读取 value
-            var totalSize = 4 + 8 + keyLen + 4 + (valLen >= 0 ? valLen : 0);
+            var valDataLen = valLen >= 0 ? valLen : 0;
+            var valueBuf = new byte[valDataLen];
+            if (valDataLen > 0) _activeLog.ReadExactly(valueBuf);
+
+            // CRC32 校验：覆盖 payload（keyLen + timestamp + key + valLen + value）
+            var totalSize = HeaderSize + keyLen + 4 + valDataLen;
+            var fullBuf = new byte[totalSize];
+            Buffer.BlockCopy(headerBuf, 0, fullBuf, 0, HeaderSize);
+            Buffer.BlockCopy(keyBuf, 0, fullBuf, HeaderSize, keyLen);
+            Buffer.BlockCopy(valLenBuf, 0, fullBuf, HeaderSize + keyLen, 4);
+            if (valDataLen > 0) Buffer.BlockCopy(valueBuf, 0, fullBuf, HeaderSize + keyLen + 4, valDataLen);
+
+            var actualCrc = Crc32.Compute(fullBuf.AsSpan(CrcSize, totalSize - CrcSize));
+            if (storedCrc != actualCrc)
+            {
+                corruptedCount++;
+                offset += totalSize;
+                continue; // 跳过损坏记录，继续重建
+            }
 
             if (valLen >= 0)
             {
-                var valueBuf = new byte[valLen];
-                _activeLog.ReadExactly(valueBuf);
                 var value = System.Text.Encoding.UTF8.GetString(valueBuf);
-
                 _index[key] = new BitcaskEntry(offset, timestamp, key, value, totalSize);
             }
             else
@@ -417,6 +454,10 @@ internal sealed class Bitcask : IDisposable
         }
 
         _currentOffset = offset;
+        if (corruptedCount > 0)
+        {
+            Console.Error.WriteLine($"Bitcask: 重建索引时跳过 {corruptedCount} 条损坏记录（CRC 校验失败）");
+        }
     }
 
     public void Dispose()
@@ -429,5 +470,42 @@ internal sealed class Bitcask : IDisposable
                 _activeLog?.Dispose();
             }
         }
+    }
+}
+
+// ============================================================================
+// CRC32 计算（Castagnoli 多项式 0x1EDC6F41）
+// 用于 Bitcask 记录完整性校验
+// ============================================================================
+
+internal static class Crc32
+{
+    private static readonly uint[] CrcTable = GenerateTable();
+
+    private static uint[] GenerateTable()
+    {
+        const uint polynomial = 0x1EDC6F41; // Castagnoli
+        var table = new uint[256];
+        for (uint i = 0; i < 256; i++)
+        {
+            var crc = i;
+            for (int j = 0; j < 8; j++)
+            {
+                crc = (crc & 1) != 0 ? (crc >> 1) ^ polynomial : crc >> 1;
+            }
+            table[i] = crc;
+        }
+        return table;
+    }
+
+    /// <summary>计算 CRC32（Castagnoli）</summary>
+    public static uint Compute(ReadOnlySpan<byte> data)
+    {
+        var crc = 0xFFFFFFFF;
+        foreach (var b in data)
+        {
+            crc = CrcTable[(crc ^ b) & 0xFF] ^ (crc >> 8);
+        }
+        return crc ^ 0xFFFFFFFF;
     }
 }
