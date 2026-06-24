@@ -173,6 +173,73 @@ internal sealed class Bitcask : IDisposable
         }
     }
 
+    // ── 前缀查询（Hash/ZSet 字段级 key 支持） ──
+
+    /// <summary>
+    /// 获取所有以 prefix 开头的 key
+    /// </summary>
+    public List<string> GetKeysByPrefix(string prefix)
+    {
+        lock (_lock)
+        {
+            return _index.Keys
+                .Where(k => k.StartsWith(prefix, StringComparison.Ordinal))
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// 获取所有以 prefix 开头的 key-value 对，按 offset 排序后顺序读取（顺序 IO）
+    /// </summary>
+    public Dictionary<string, string> GetAllByPrefix(string prefix)
+    {
+        lock (_lock)
+        {
+            // 1. 收集匹配条目，按 offset 排序（顺序 IO，利用 OS 预读）
+            var matching = _index
+                .Where(kv => kv.Key.StartsWith(prefix, StringComparison.Ordinal))
+                .OrderBy(kv => kv.Value.Offset)
+                .ToList();
+
+            if (matching.Count == 0)
+                return new Dictionary<string, string>();
+
+            var result = new Dictionary<string, string>();
+            foreach (var (key, entry) in matching)
+            {
+                _activeLog.Seek(entry.Offset, SeekOrigin.Begin);
+                var buffer = new byte[entry.TotalSize];
+                _activeLog.ReadExactly(buffer);
+                var decoded = DecodeEntry(buffer);
+                if (decoded.Value != null)
+                    result[key] = decoded.Value;
+            }
+
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// 提取唯一前缀：从 "prefix\0{key}\0{field}" 格式的 key 中提取逻辑 key
+    /// </summary>
+    public HashSet<string> GetUniqueLogicalKeys(string prefix)
+    {
+        lock (_lock)
+        {
+            var keys = new HashSet<string>();
+            foreach (var key in _index.Keys)
+            {
+                if (!key.StartsWith(prefix, StringComparison.Ordinal)) continue;
+                // 格式: prefix\0{logicalKey}\0{field}
+                var rest = key.Substring(prefix.Length);
+                var sepIdx = rest.IndexOf('\0');
+                if (sepIdx > 0)
+                    keys.Add(rest.Substring(0, sepIdx));
+            }
+            return keys;
+        }
+    }
+
     // ── 压缩合并 ──
 
     /// <summary>
