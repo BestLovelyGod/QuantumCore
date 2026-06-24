@@ -20,28 +20,8 @@ using QuantumCore.Memory;
 
 namespace QuantumCore;
 
-/// <summary>
-/// 脏数据条目类型
-/// </summary>
-internal enum DirtyEntryType : byte
-{
-    String = 1,
-    Hash = 2,
-    ZSet = 3,
-    Delete = 0xFF
-}
-
-/// <summary>
-/// 脏数据条目
-/// </summary>
-internal readonly record struct DirtyEntry(
-    DirtyEntryType Type,
-    string Key,
-    string? Field,   // Hash 用
-    string? Value,   // String/Hash 用
-    double? Score,   // ZSet 用
-    bool Remove      // true = 删除操作
-);
+// DirtyEntry 已迁移为多态类层次（见 DirtyEntry.cs）
+// 每种操作类型独立子类，构造函数保证字段合法，FlushToAsync 消除 switch
 
 /// <summary>
 /// 混合存储引擎 — 统一调度内存引擎和磁盘引擎
@@ -98,7 +78,7 @@ public sealed class HybridStore : IHybridStore
             _wal.Append(new WalEntry(WalOp.StringSet, key, null, value, 0));
 
         _memory.StringSet(key, value, expiry);
-        _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.String, key, null, value, null, false));
+        _dirtyQueue.Enqueue(new DirtyStringSet(key, value));
         return Task.FromResult(true);
     }
 
@@ -164,7 +144,7 @@ public sealed class HybridStore : IHybridStore
             _wal.Append(new WalEntry(WalOp.HashSet, key, field, value, 0));
 
         _memory.HashSet(key, field, value);
-        _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.Hash, key, field, value, null, false));
+        _dirtyQueue.Enqueue(new DirtyHashSet(key, field, value));
         return Task.FromResult(true);
     }
 
@@ -193,7 +173,7 @@ public sealed class HybridStore : IHybridStore
             if (_options.WalEnabled)
                 _wal.Append(new WalEntry(WalOp.HashDelete, key, field, null, 0));
 
-            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.Hash, key, field, null, null, true));
+            _dirtyQueue.Enqueue(new DirtyHashDelete(key, field));
             // 如果整个 Hash 空了，标记删除磁盘 key
             var remaining = _memory.HashGetAll(key);
             if (remaining.Count == 0)
@@ -230,7 +210,7 @@ public sealed class HybridStore : IHybridStore
             _wal.Append(new WalEntry(WalOp.ZSetAdd, key, member, null, score));
 
         _memory.ZSetAdd(key, member, score);
-        _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.ZSet, key, member, null, score, false));
+        _dirtyQueue.Enqueue(new DirtyZSetAdd(key, member, score));
         return Task.FromResult(true);
     }
 
@@ -275,7 +255,7 @@ public sealed class HybridStore : IHybridStore
             if (_options.WalEnabled)
                 _wal.Append(new WalEntry(WalOp.ZSetRemove, key, member, null, 0));
 
-            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.ZSet, key, member, null, null, true));
+            _dirtyQueue.Enqueue(new DirtyZSetRemove(key, member));
             // 如果整个 ZSet 空了，标记删除磁盘 key
             var remaining = _memory.ZSetScore(key, "__probe__");
             if (remaining == null)
@@ -412,39 +392,39 @@ public sealed class HybridStore : IHybridStore
                         if (entry.Value != null)
                         {
                             _memory.StringSet(entry.Key, entry.Value);
-                            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.String, entry.Key, null, entry.Value, null, false));
+                            _dirtyQueue.Enqueue(new DirtyStringSet(entry.Key, entry.Value));
                         }
                         break;
                     case WalOp.StringDelete:
                         _memory.StringDelete(entry.Key);
-                        _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.String, entry.Key, null, null, null, true));
+                        _dirtyQueue.Enqueue(new DirtyStringDelete(entry.Key));
                         break;
                     case WalOp.HashSet:
                         if (entry.Field != null && entry.Value != null)
                         {
                             _memory.HashSet(entry.Key, entry.Field, entry.Value);
-                            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.Hash, entry.Key, entry.Field, entry.Value, null, false));
+                            _dirtyQueue.Enqueue(new DirtyHashSet(entry.Key, entry.Field, entry.Value));
                         }
                         break;
                     case WalOp.HashDelete:
                         if (entry.Field != null)
                         {
                             _memory.HashDelete(entry.Key, entry.Field);
-                            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.Hash, entry.Key, entry.Field, null, null, true));
+                            _dirtyQueue.Enqueue(new DirtyHashDelete(entry.Key, entry.Field));
                         }
                         break;
                     case WalOp.ZSetAdd:
                         if (entry.Field != null)
                         {
                             _memory.ZSetAdd(entry.Key, entry.Field, entry.Score);
-                            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.ZSet, entry.Key, entry.Field, null, entry.Score, false));
+                            _dirtyQueue.Enqueue(new DirtyZSetAdd(entry.Key, entry.Field, entry.Score));
                         }
                         break;
                     case WalOp.ZSetRemove:
                         if (entry.Field != null)
                         {
                             _memory.ZSetRemove(entry.Key, entry.Field);
-                            _dirtyQueue.Enqueue(new DirtyEntry(DirtyEntryType.ZSet, entry.Key, entry.Field, null, null, true));
+                            _dirtyQueue.Enqueue(new DirtyZSetRemove(entry.Key, entry.Field));
                         }
                         break;
                 }
@@ -489,37 +469,10 @@ public sealed class HybridStore : IHybridStore
                         if (_disposed) break;
 
                         // 跳过已标记删除的 key
-                        var tag = entry.Type switch
-                        {
-                            DirtyEntryType.String => $"str:{entry.Key}",
-                            DirtyEntryType.Hash => $"hash:{entry.Key}",
-                            DirtyEntryType.ZSet => $"zset:{entry.Key}",
-                            _ => entry.Key
-                        };
-                        if (_deletedKeys.ContainsKey(tag)) continue;
+                        if (_deletedKeys.ContainsKey(entry.DeletionTag)) continue;
 
-                        // 按类型刷盘
-                        switch (entry.Type)
-                        {
-                            case DirtyEntryType.String:
-                                if (entry.Remove)
-                                    await _disk.DeleteStringAsync(entry.Key);
-                                else if (entry.Value != null)
-                                    await _disk.PersistStringAsync(entry.Key, entry.Value);
-                                break;
-                            case DirtyEntryType.Hash:
-                                if (entry.Remove)
-                                    await _disk.RemoveHashFieldAsync(entry.Key, entry.Field!);
-                                else
-                                    await _disk.PersistHashFieldAsync(entry.Key, entry.Field!, entry.Value!);
-                                break;
-                            case DirtyEntryType.ZSet:
-                                if (entry.Remove)
-                                    await _disk.RemoveZSetMemberAsync(entry.Key, entry.Field!);
-                                else
-                                    await _disk.PersistZSetMemberAsync(entry.Key, entry.Field!, entry.Score!.Value);
-                                break;
-                        }
+                        // 多态刷盘
+                        await entry.FlushToAsync(_disk);
                     }
                 }
                 catch
@@ -542,30 +495,8 @@ public sealed class HybridStore : IHybridStore
     {
         while (_dirtyQueue.TryDequeue(out var entry))
         {
-            var tag = entry.Type switch
-            {
-                DirtyEntryType.String => $"str:{entry.Key}",
-                DirtyEntryType.Hash => $"hash:{entry.Key}",
-                DirtyEntryType.ZSet => $"zset:{entry.Key}",
-                _ => entry.Key
-            };
-            if (_deletedKeys.ContainsKey(tag)) continue;
-
-            switch (entry.Type)
-            {
-                case DirtyEntryType.String:
-                    if (entry.Value != null)
-                        await _disk.PersistStringAsync(entry.Key, entry.Value);
-                    break;
-                case DirtyEntryType.Hash:
-                    if (entry.Field != null && entry.Value != null)
-                        await _disk.PersistHashFieldAsync(entry.Key, entry.Field, entry.Value);
-                    break;
-                case DirtyEntryType.ZSet:
-                    if (entry.Field != null && entry.Score != null)
-                        await _disk.PersistZSetMemberAsync(entry.Key, entry.Field, entry.Score.Value);
-                    break;
-            }
+            if (_deletedKeys.ContainsKey(entry.DeletionTag)) continue;
+            await entry.FlushToAsync(_disk);
         }
 
         // 刷盘完成，截断 WAL
